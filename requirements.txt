@@ -1,0 +1,20 @@
+# Product Matching & Search Agent
+# Python >= 3.11
+
+# GigaChat LLM + Embeddings
+langchain-gigachat==0.5.1
+
+# LangChain core (messages, runnables)
+langchain-core==1.4.0
+
+# LangGraph agent orchestration
+langgraph==1.2.0
+
+# Numerical computing (embeddings, cosine similarity)
+numpy==2.4.4
+
+# Data loading and manipulation
+pandas==3.0.3
+
+# .env file support (GIGACHAT_CREDENTIALS etc.)
+python-dotenv==1.2.2

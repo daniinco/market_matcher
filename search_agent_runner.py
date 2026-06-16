@@ -1,12 +1,15 @@
 """CLI entry point for the LangGraph product search agent.
 
 Usage:
-  # Single-shot mode:
+  # Pass initial query as argument (stdin stays open for clarification answers):
+  .venv/bin/python search_agent_runner.py "стол"
   .venv/bin/python search_agent_runner.py "двухспальная кровать"
-  .venv/bin/python search_agent_runner.py "Книжный шкаф Лофт 100×25×80 черный"
 
-  # Interactive REPL mode (no arguments):
+  # Interactive REPL mode (no arguments — agent asks for query interactively):
   .venv/bin/python search_agent_runner.py
+
+In both modes stdin remains open, so when the clarification_node asks a
+follow-up question the user can type the answer directly in the terminal.
 """
 from __future__ import annotations
 
@@ -42,29 +45,34 @@ def main() -> None:
     total_vecs = sum(v[0].shape[0] for v in embedding_data.values())
     print(f"  {total_vecs} vectors loaded")
 
-    # ── Single-shot or interactive ─────────────────────────────────────────────
-    if len(sys.argv) > 1:
-        # Single-shot: query passed as CLI argument
-        query = " ".join(sys.argv[1:])
-        run_search(query, supplier_data=supplier_data, embedding_data=embedding_data)
-    else:
-        # Interactive REPL
-        print("\nВведите запрос для поиска товара (или 'exit' для выхода):")
-        print("-" * 60)
-        while True:
+    # ── Determine first query ──────────────────────────────────────────────────
+    # If a query was passed as CLI argument, use it for the first search.
+    # Either way, stdin stays open so clarification_node can call input().
+    first_query: str | None = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else None
+
+    print("\nВведите запрос для поиска товара (или 'exit' для выхода):")
+    print("-" * 60)
+
+    while True:
+        if first_query is not None:
+            # Use the CLI argument as the first query without prompting
+            query = first_query
+            first_query = None          # only use it once
+            print(f"\n> {query}")       # echo so the user sees what was submitted
+        else:
             try:
                 query = input("\n> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nВыход.")
                 break
 
-            if not query:
-                continue
-            if query.lower() in ("exit", "quit", "выход", "q"):
-                print("Выход.")
-                break
+        if not query:
+            continue
+        if query.lower() in ("exit", "quit", "выход", "q"):
+            print("Выход.")
+            break
 
-            run_search(query, supplier_data=supplier_data, embedding_data=embedding_data)
+        run_search(query, supplier_data=supplier_data, embedding_data=embedding_data)
 
 
 if __name__ == "__main__":

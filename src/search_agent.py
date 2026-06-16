@@ -1,13 +1,14 @@
 """LangGraph Search Agent — find products across supplier catalogues by free-text query.
 
 Flow:
-  normalize_node  → rewrite conversational query to product description
-  search_node     → embed query, cosine top-15 per supplier file
-  judge_node      → GigaChat judges each hit: does it match the query?
-  check_count_node→ route: ≥8 found → format; else → expand outliers
-  expand_node     → fetch ranks 16-25 from 3 most-distant non-match files
+  clarification_node  → detect vague queries, ask one follow-up question
+  normalize_node      → rewrite conversational query to product description
+  search_node         → embed query, cosine top-15 per supplier file
+  judge_node          → GigaChat judges each hit: does it match the query?
+  check_count_node    → route: ≥8 found → format; else → expand outliers
+  expand_node         → fetch ranks 16-25 from 3 most-distant non-match files
   judge_expanded_node → judge expanded hits
-  format_node     → expand via clusters, deduplicate, print results
+  format_node         → expand via clusters, deduplicate, print results
 """
 from __future__ import annotations
 
@@ -40,8 +41,15 @@ CLUSTERS_CSV = OUTPUT_DIR / "clusters_predicted.csv"
 
 TOP_K = 15          # candidates per file in initial search
 EXPAND_K = 10       # extra candidates per file in expansion
-N_OUTLIERS = 3      # number of most-distant non-matches to expand around
 MIN_RESULTS = 8     # stop early if this many matches found
+
+# System prompt for the judge role
+JUDGE_SYSTEM_PROMPT = (
+    "Ты эксперт по подбору мебели и товаров для дома. "
+    "Твоя задача — определить, соответствует ли товар из каталога запросу пользователя. "
+    "Учитывай тип товара, размеры, материал, цвет и стиль. "
+    "Отвечай строго JSON без markdown."
+)
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -69,6 +77,7 @@ class ResultItem:
 
 class SearchAgentState(TypedDict):
     raw_query: str
+    clarification_answer: str    # user's answer to clarifying question (empty if not needed)
     normalized_query: str
     supplier_data: dict          # dict[str, pd.DataFrame]
     embedding_data: dict         # dict[str, (np.ndarray, list[int])]
@@ -79,6 +88,69 @@ class SearchAgentState(TypedDict):
     expanded_hits: list          # list[SearchHit]
     final_results: list          # list[ResultItem]
     phase: str                   # "initial" | "expanded"
+
+
+# ── Node 0: clarification_node ────────────────────────────────────────────────
+
+def clarification_node(state: SearchAgentState) -> SearchAgentState:
+    """Detect vague queries and ask one clarifying question before normalization."""
+    raw = state["raw_query"]
+    print(f"\n[0/6] Checking if query needs clarification: {raw!r}")
+
+    llm = get_llm()
+    messages = [
+        SystemMessage(content=(
+            "Ты помощник по поиску мебели и товаров для дома. "
+            "Определи, является ли запрос пользователя слишком общим — "
+            "например, просто 'стол', 'кровать', 'шкаф', 'диван', 'кресло' без каких-либо уточнений "
+            "(размера, цвета, материала, стиля, назначения). "
+            "Если запрос слишком общий — сформулируй ОДИН короткий уточняющий вопрос. "
+            "Если запрос уже достаточно конкретный — верни пустую строку в поле question. "
+            "Ответь строго JSON без markdown: "
+            '{\"is_vague\": true/false, \"question\": \"...\"}'
+        )),
+        HumanMessage(content=raw),
+    ]
+
+    is_vague = False
+    question = ""
+    try:
+        response = llm.invoke(messages)
+        text = response.content.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        data = json.loads(text)
+        is_vague = bool(data.get("is_vague", False))
+        question = str(data.get("question", "")).strip()
+    except Exception as e:
+        print(f"  WARNING: clarification check failed ({e}), skipping")
+
+    clarification_answer = ""
+    enriched_query = raw
+
+    if is_vague and question:
+        print(f"\n  Запрос слишком общий. Уточняющий вопрос:")
+        print(f"  {question}")
+        try:
+            answer = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer:
+            clarification_answer = answer
+            enriched_query = f"{raw}, {answer}"
+            print(f"  Уточнённый запрос: {enriched_query!r}")
+        else:
+            print("  Ответ не получен, продолжаем с исходным запросом")
+    else:
+        print("  Запрос достаточно конкретный, уточнение не требуется")
+
+    return {
+        **state,
+        "raw_query": enriched_query,
+        "clarification_answer": clarification_answer,
+    }
 
 
 # ── Node 1: normalize_node ─────────────────────────────────────────────────────
@@ -198,7 +270,10 @@ def _judge_hits(
             '{"match": true/false, "reason": "краткое объяснение"}'
         )
         try:
-            response = llm.invoke([HumanMessage(content=prompt)])
+            response = llm.invoke([
+                SystemMessage(content=JUDGE_SYSTEM_PROMPT),
+                HumanMessage(content=prompt),
+            ])
             text = response.content.strip()
             # Strip markdown code fences if present
             if text.startswith("```"):
@@ -238,15 +313,11 @@ def judge_node(state: SearchAgentState) -> SearchAgentState:
 
     print(f"  Accepted: {len(accepted)}  Rejected: {len(rejected)}")
 
-    # Identify outliers: 3 rejected hits with lowest cosine score
-    rejected_sorted = sorted(rejected, key=lambda h: h.cosine_score)
-    outliers = rejected_sorted[:N_OUTLIERS]
-
     return {
         **state,
         "accepted": accepted,
         "rejected": rejected,
-        "outliers": outliers,
+        "outliers": [],   # no longer computed here — expand_node uses top15_per_file directly
         "phase": "initial",
     }
 
@@ -259,8 +330,8 @@ def check_count_node(state: SearchAgentState) -> SearchAgentState:
     print(f"\n[4/6] Check: {n} matches found (threshold={MIN_RESULTS})")
     if n >= MIN_RESULTS:
         print(f"  → Enough results, proceeding to format")
-    elif state["outliers"] and state["phase"] == "initial":
-        print(f"  → Too few results, expanding {len(state['outliers'])} outlier files")
+    elif state["phase"] == "initial":
+        print(f"  → Too few results, will run per-file gate check + expansion")
     else:
         print(f"  → No more expansion possible, proceeding to format")
     return state
@@ -270,51 +341,103 @@ def route_after_check(state: SearchAgentState) -> str:
     """Conditional edge: expand or format."""
     if len(state["accepted"]) >= MIN_RESULTS:
         return "format"
-    if state["outliers"] and state["phase"] == "initial":
+    if state["phase"] == "initial":
         return "expand"
     return "format"
 
 
 # ── Node 5: expand_node ────────────────────────────────────────────────────────
 
+# Number of bottom hits per file to show GigaChat in the gate check
+N_GATE_HITS = 3
+
+
+def _gate_check_file(fname: str, bottom_hits: list[SearchHit], query: str, llm: Any) -> bool:
+    """Ask GigaChat whether any of the bottom-ranked hits from a file are even
+    remotely relevant to the query.  Returns True if the file is worth expanding.
+    """
+    items_text = "\n".join(
+        f"  {i+1}. {h.product_name} — {h.price_rub:.0f} руб."
+        for i, h in enumerate(bottom_hits)
+    )
+    prompt = (
+        f"Пользователь ищет: {query}\n\n"
+        f"Вот {len(bottom_hits)} товара из каталога поставщика:\n{items_text}\n\n"
+        "Хотя бы один из этих товаров хоть отдалённо похож на то, что ищет пользователь? "
+        "Ответь строго JSON без markdown: "
+        '{"worth_expanding": true/false, "reason": "краткое объяснение"}'
+    )
+    try:
+        response = llm.invoke([
+            SystemMessage(content=JUDGE_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ])
+        text = response.content.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        data = json.loads(text)
+        return bool(data.get("worth_expanding", False))
+    except Exception as e:
+        # On failure, be conservative and expand anyway
+        print(f"    WARNING: gate check failed ({e}), expanding by default")
+        return True
+
+
 def expand_node(state: SearchAgentState) -> SearchAgentState:
-    """Fetch ranks 16-25 from the 3 most-distant non-match files."""
+    """Per-file gate check: ask GigaChat if the 3 least-similar top-15 hits from
+    each file are even remotely relevant.  Only fetch ranks 16-25 for files that
+    pass the gate.
+    """
     query_text = state["normalized_query"]
-    outliers = state["outliers"]
+    top15_per_file = state["top15_per_file"]
     supplier_data = state["supplier_data"]
     embedding_data = state["embedding_data"]
 
-    # Embed query again (reuse embedder)
+    llm = get_llm()
+
+    # Embed query (reuse embedder)
     embedder = get_embedder()
     query_vec = np.array(embedder.embed_query(query_text), dtype=np.float32).reshape(1, -1)
 
-    # Collect files to expand (unique files from outliers)
-    expand_files: list[str] = []
-    seen_files: set[str] = set()
-    for hit in outliers:
-        if hit.file not in seen_files:
-            expand_files.append(hit.file)
-            seen_files.add(hit.file)
-
     # Track already-seen (file, row_id) pairs to avoid duplicates
     seen_pairs: set[tuple[str, int]] = set()
-    for hits in state["top15_per_file"].values():
+    for hits in top15_per_file.values():
         for h in hits:
             seen_pairs.add((h.file, h.row_id))
 
-    print(f"\n[5/6] Expanding: fetching ranks {TOP_K+1}–{TOP_K+EXPAND_K} from {len(expand_files)} files...")
+    print(f"\n[5/6] Per-file gate check + expansion (ranks {TOP_K+1}–{TOP_K+EXPAND_K})...")
 
     expanded_hits: list[SearchHit] = []
+    files_expanded = 0
+    files_skipped = 0
 
-    for fname in expand_files:
+    for fname, hits in top15_per_file.items():
+        supplier_tag = fname.split("_")[1] if "_" in fname else fname
+
+        # Take the N_GATE_HITS least-similar hits from this file's top-15
+        # (they are already sorted descending by cosine, so take the tail)
+        bottom_hits = hits[-N_GATE_HITS:] if len(hits) >= N_GATE_HITS else hits
+
+        # Gate check: is this file worth expanding?
+        worth_it = _gate_check_file(fname, bottom_hits, query_text, llm)
+
+        if not worth_it:
+            print(f"  {supplier_tag}: gate=NO  → skipping")
+            files_skipped += 1
+            continue
+
+        print(f"  {supplier_tag}: gate=YES → fetching ranks {TOP_K+1}–{TOP_K+EXPAND_K}")
+
         if fname not in embedding_data:
             continue
+
         df = supplier_data[fname]
         vecs, row_ids = embedding_data[fname]
         vecs_arr = np.array(vecs, dtype=np.float32)
 
         sim = cosine_similarity_matrix(query_vec, vecs_arr)[0]
-        # All indices sorted descending
         all_idx = np.argsort(sim)[::-1]
 
         count = 0
@@ -338,9 +461,10 @@ def expand_node(state: SearchAgentState) -> SearchAgentState:
             if count >= EXPAND_K:
                 break
 
-        supplier_tag = fname.split("_")[1] if "_" in fname else fname
-        print(f"  {supplier_tag}: +{count} expanded hits")
+        print(f"    → +{count} candidates added")
+        files_expanded += 1
 
+    print(f"  Summary: {files_expanded} files expanded, {files_skipped} skipped by gate")
     return {**state, "expanded_hits": expanded_hits, "phase": "expanded"}
 
 
@@ -480,6 +604,7 @@ def format_node(state: SearchAgentState) -> SearchAgentState:
 def build_search_graph() -> Any:
     graph = StateGraph(SearchAgentState)
 
+    graph.add_node("clarification_node", clarification_node)
     graph.add_node("normalize_node", normalize_node)
     graph.add_node("search_node", search_node)
     graph.add_node("judge_node", judge_node)
@@ -488,7 +613,8 @@ def build_search_graph() -> Any:
     graph.add_node("judge_expanded_node", judge_expanded_node)
     graph.add_node("format_node", format_node)
 
-    graph.add_edge(START, "normalize_node")
+    graph.add_edge(START, "clarification_node")
+    graph.add_edge("clarification_node", "normalize_node")
     graph.add_edge("normalize_node", "search_node")
     graph.add_edge("search_node", "judge_node")
     graph.add_edge("judge_node", "check_count_node")
@@ -534,6 +660,7 @@ def run_search(
 
     initial_state: SearchAgentState = {
         "raw_query": query,
+        "clarification_answer": "",
         "normalized_query": "",
         "supplier_data": supplier_data,
         "embedding_data": embedding_data,
